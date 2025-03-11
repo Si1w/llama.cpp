@@ -279,7 +279,7 @@ class MODEL_ARCH(IntEnum):
     GRANITE_MOE      = auto()
     CHAMELEON        = auto()
     WAVTOKENIZER_DEC = auto()
-    PLM              = auto()
+    EDGELLM          = auto()
 
 
 class MODEL_TENSOR(IntEnum):
@@ -467,7 +467,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.GRANITE_MOE:      "granitemoe",
     MODEL_ARCH.CHAMELEON:        "chameleon",
     MODEL_ARCH.WAVTOKENIZER_DEC: "wavtokenizer-dec",
-    MODEL_ARCH.PLM:              "plm",
+    MODEL_ARCH.EDGELLM:          "edgellm",
 }
 
 TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
@@ -1352,7 +1352,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
     ],
-    MODEL_ARCH.PLM: [
+    MODEL_ARCH.EDGELLM: [
         MODEL_TENSOR.TOKEN_EMBD,        
         MODEL_TENSOR.OUTPUT,
         MODEL_TENSOR.OUTPUT_NORM,  

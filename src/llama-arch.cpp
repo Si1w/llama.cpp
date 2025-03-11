@@ -62,7 +62,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GRANITE_MOE,      "granitemoe"       },
     { LLM_ARCH_CHAMELEON,        "chameleon"        },
     { LLM_ARCH_WAVTOKENIZER_DEC, "wavtokenizer-dec" },
-    { LLM_ARCH_PLM,              "plm"              },
+    { LLM_ARCH_EDGELLM,          "edgellm"          },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -1017,7 +1017,7 @@ static const std::map<llm_arch, std::map<llm_tensor, const char *>> LLM_TENSOR_N
         },
     },
     {
-        LLM_ARCH_PLM,
+        LLM_ARCH_EDGELLM,
         {
             { LLM_TENSOR_TOKEN_EMBD,         "token_embd" },
             { LLM_TENSOR_OUTPUT_NORM,        "output_norm" },
