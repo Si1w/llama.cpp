@@ -552,6 +552,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                         case 36: type = LLM_TYPE_8B; break; // granite
                         case 40: type = LLM_TYPE_13B; break;
                         case 48: type = LLM_TYPE_34B; break;
+                        case 54: type = LLM_TYPE_1_3B; break;
                         case 60: type = LLM_TYPE_30B; break;
                         case 80: type = hparams.n_head() == hparams.n_head_kv() ? LLM_TYPE_65B : LLM_TYPE_70B; break;
                         default: type = LLM_TYPE_UNKNOWN;
@@ -1719,16 +1720,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         auto & layer = layers[i];
 
                         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
-
-                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
-                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k_gqa}, 0);
-                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v_gqa}, 0);
-                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+                        layer.wg = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_embd}, 0);
+                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * 5}, 0);
+                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_head_k}, 0);
+                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_head_v * 2}, 0);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0);
+                        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), {n_embd_head_v * 5 * 2, n_embd_head_v * 4}, 0);
 
                         // optional bias tensors
-                        layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd},     TENSOR_NOT_REQUIRED);
-                        layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_gqa}, TENSOR_NOT_REQUIRED);
-                        layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_gqa}, TENSOR_NOT_REQUIRED);
+                        layer.bg = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "bias", i), {n_embd}, TENSOR_NOT_REQUIRED);
+                        layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd_head_k * 5},     TENSOR_NOT_REQUIRED);
+                        layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_head_k}, TENSOR_NOT_REQUIRED);
+                        layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_head_k * 2}, TENSOR_NOT_REQUIRED);
                         layer.bo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd},     TENSOR_NOT_REQUIRED);
 
                         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
@@ -4468,6 +4471,7 @@ ggml_tensor * llama_model::get_rope_factors(uint32_t n_ctx_per_seq, int il) cons
 struct llm_build_llama : public llm_graph_context {
     llm_build_llama(const llama_model & model, const llm_graph_params & params, ggml_cgraph * gf) : llm_graph_context(params) {
         const int64_t n_embd_head = hparams.n_embd_head_v;
+        const int64_t n_q_head = 5;
 
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
         GGML_ASSERT(n_embd_head == hparams.n_rot);
@@ -4529,9 +4533,12 @@ struct llm_build_llama : public llm_graph_context {
                     cb(Vcur, "Vcur", il);
                 }
 
-                Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
+                ggml_tensor * Ocur = build_lora_mm(model.layers[il].wo, cur);
+                cb(Ocur, "Ocur", il);
+
+                Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_q_head, n_tokens);
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-                Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+                Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_v * 2, n_head_kv, n_tokens);
 
                 if (use_rope) {
                     Qcur = ggml_rope_ext(
@@ -4553,17 +4560,32 @@ struct llm_build_llama : public llm_graph_context {
                 cb(Kcur, "Kcur", il);
                 cb(Vcur, "Vcur", il);
 
-                if (arch == LLM_ARCH_LLAMA4 && use_rope && hparams.use_kq_norm) {
-                    // Llama4TextL2Norm
-                    Qcur = ggml_rms_norm(ctx0, Qcur, hparams.f_norm_rms_eps);
-                    Kcur = ggml_rms_norm(ctx0, Kcur, hparams.f_norm_rms_eps);
-                    cb(Qcur, "Qcur_normed", il);
-                    cb(Kcur, "Kcur_normed", il);
-                }
-
+                // cur shape (640, 512, 1, 1)
                 cur = build_attn(inp_attn, gf,
-                        model.layers[il].wo, model.layers[il].bo,
+                        NULL, NULL,
                         Qcur, Kcur, Vcur, nullptr, nullptr, kq_scale, il);
+                // cur reshape (b, q, h, v) -> (1, 512, 5, 128)
+                ggml_tensor * cur_reshape = ggml_reshape_4d(ctx0, cur, n_embd_head * 2, n_q_head, cur->ne[1], cur->ne[2]); // (128, 5, 512, 1)
+                cur_reshape = ggml_permute(ctx0, cur_reshape, 3, 2, 1, 0); // (1, 512, 5, 128)
+                cur_reshape = ggml_cont(ctx0, cur_reshape);
+                cur_reshape = ggml_reshape_3d(ctx0, cur_reshape, cur_reshape->ne[2], cur_reshape->ne[3], cur_reshape->ne[1]); // (5, 128, 512)
+
+                // wv_b shape (h, v, d) -> (5, 128, 256)
+                ggml_tensor * wv_b_reshape = ggml_reshape_3d(ctx0, model.layers[il].wv, n_q_head, n_embd_head * 2, n_embd_head * 4);
+
+                // Einsum
+                cur_reshape = ggml_reshape_3d(ctx0, cur_reshape, cur_reshape->ne[1], cur_reshape->ne[2], cur_reshape->ne[0]); // (128, 512, 5)
+                wv_b_reshape = ggml_reshape_3d(ctx0, wv_b_reshape, wv_b_reshape->ne[1], wv_b_reshape->ne[2], wv_b_reshape->ne[0]); // (128, 256, 5)
+                ggml_tensor * einsum = ggml_mul_mat(ctx0, wv_b_reshape, cur_reshape); // (256, 512, 5)
+
+                cur = ggml_reshape_3d(ctx0, cur, cur->ne[0]/n_q_head, cur->ne[1], n_q_head); // (128, 512, 5)
+                cur = ggml_repeat(ctx0, cur, einsum);
+                cur = ggml_add(ctx0, cur, einsum);
+                cur = ggml_cont(ctx0, cur);
+                cur = ggml_reshape_2d(ctx0, cur, n_embd, cur->ne[1]);
+
+                Ocur = ggml_sigmoid(ctx0, Ocur);
+                cur = ggml_mul(ctx0, cur, Ocur);
                 cb(cur, "attn_out", il);
             }
 
@@ -4574,22 +4596,15 @@ struct llm_build_llama : public llm_graph_context {
                 inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
 
-            // For Granite architecture
-            if (hparams.f_residual_scale) {
-                cur = ggml_scale(ctx0, cur, hparams.f_residual_scale);
-            }
-
             ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
             cb(ffn_inp, "ffn_inp", il);
 
             // feed-forward network (non-MoE)
             if (model.layers[il].ffn_gate_inp == nullptr) {
-
                 cur = build_norm(ffn_inp,
                         model.layers[il].ffn_norm, NULL,
                         LLM_NORM_RMS, il);
                 cb(cur, "ffn_norm", il);
-
                 cur = build_ffn(cur,
                         model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   NULL,
                         model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, NULL,
@@ -4597,62 +4612,6 @@ struct llm_build_llama : public llm_graph_context {
                         NULL,
                         LLM_FFN_SILU, LLM_FFN_PAR, il);
                 cb(cur, "ffn_out", il);
-
-            } else if (arch == LLM_ARCH_LLAMA4) {
-                // llama4 MoE
-                ggml_tensor * ffn_inp_normed = build_norm(ffn_inp,
-                        model.layers[il].ffn_norm, NULL,
-                        LLM_NORM_RMS, il);
-                cb(cur, "ffn_norm", il);
-
-                ggml_tensor * moe_out = build_moe_ffn(ffn_inp_normed,
-                        model.layers[il].ffn_gate_inp,
-                        model.layers[il].ffn_up_exps,
-                        model.layers[il].ffn_gate_exps,
-                        model.layers[il].ffn_down_exps,
-                        nullptr,
-                        n_expert, n_expert_used,
-                        LLM_FFN_SILU, false,
-                        false, 0.0,
-                        LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
-                        il);
-
-                // Shared experts
-                ggml_tensor * shexp_out = build_ffn(ffn_inp_normed,
-                    model.layers[il].ffn_up_shexp,   NULL, NULL,
-                    model.layers[il].ffn_gate_shexp, NULL, NULL,
-                    model.layers[il].ffn_down_shexp, NULL, NULL,
-                    NULL,
-                    LLM_FFN_SILU, LLM_FFN_PAR, il);
-                cb(shexp_out, "ffn_moe_shexp", il);
-
-                cur = ggml_add(ctx0, moe_out, shexp_out);
-                cb(cur, "ffn_moe_out_merged", il);
-
-            } else {
-                // MoE branch
-                cur = build_norm(ffn_inp,
-                        model.layers[il].ffn_norm, NULL,
-                        LLM_NORM_RMS, il);
-                cb(cur, "ffn_norm", il);
-
-                cur = build_moe_ffn(cur,
-                        model.layers[il].ffn_gate_inp,
-                        model.layers[il].ffn_up_exps,
-                        model.layers[il].ffn_gate_exps,
-                        model.layers[il].ffn_down_exps,
-                        nullptr,
-                        n_expert, n_expert_used,
-                        LLM_FFN_SILU, true,
-                        false, 0.0,
-                        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
-                        il);
-                cb(cur, "ffn_moe_out", il);
-            }
-
-            // For Granite architecture
-            if (hparams.f_residual_scale) {
-                cur = ggml_scale(ctx0, cur, hparams.f_residual_scale);
             }
 
             cur = ggml_add(ctx0, cur, ffn_inp);
@@ -4666,25 +4625,17 @@ struct llm_build_llama : public llm_graph_context {
         }
 
         cur = inpL;
-
         cur = build_norm(cur,
                 model.output_norm, NULL,
                 LLM_NORM_RMS, -1);
 
         cb(cur, "result_norm", -1);
         res->t_embd = cur;
-
+        
         // lm_head
         cur = build_lora_mm(model.output, cur);
-
-        // For Granite architecture
-        if (hparams.f_logit_scale) {
-            cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_logit_scale);
-        }
-
         cb(cur, "result_output", -1);
         res->t_logits = cur;
-
         ggml_build_forward_expand(gf, cur);
     }
 };
@@ -4846,11 +4797,6 @@ struct llm_build_deci : public llm_graph_context {
 
         // lm_head
         cur = build_lora_mm(model.output, cur);
-
-        // For Granite architecture
-        if (hparams.f_logit_scale) {
-            cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_logit_scale);
-        }
 
         cb(cur, "result_output", -1);
         res->t_logits = cur;

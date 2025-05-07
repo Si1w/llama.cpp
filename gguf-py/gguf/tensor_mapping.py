@@ -665,6 +665,10 @@ class TensorNameMap:
             "model.layers.{bid}.feed_forward.value", # rwkv7
         ),
 
+        MODEL_TENSOR.ATTN_GATE: (
+            "model.layers.{bid}.self_attn.g_proj", # llama-gla
+        ),
+
         MODEL_TENSOR.ATTN_Q_A: (
             "model.layers.{bid}.self_attn.q_a_proj", # deepseek2
         ),

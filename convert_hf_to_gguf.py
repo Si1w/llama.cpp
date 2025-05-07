@@ -1818,28 +1818,43 @@ class LlamaModel(TextModel):
             self.gguf_writer.add_add_bos_token(False)
 
     def set_gguf_parameters(self):
-        super().set_gguf_parameters()
         hparams = self.hparams
-        self.gguf_writer.add_vocab_size(hparams["vocab_size"])
-
-        if "head_dim" in hparams:
-            rope_dim = hparams["head_dim"]
-        else:
-            rope_dim = hparams["hidden_size"] // hparams["num_attention_heads"]
-        self.gguf_writer.add_rope_dimension_count(rope_dim)
-
+        self.gguf_writer.add_block_count(hparams["num_hidden_layers"])
+        self.gguf_writer.add_context_length(hparams["max_position_embeddings"])
+        self.gguf_writer.add_embedding_length(hparams["hidden_size"])
+        self.gguf_writer.add_feed_forward_length(hparams["intermediate_size"])
+        self.gguf_writer.add_head_count(hparams["num_attention_heads"])
+        self.gguf_writer.add_head_count_kv(hparams["num_value_heads"])
+        if f_rms_eps := hparams.get("rms_norm_eps"):
+            self.gguf_writer.add_layer_norm_rms_eps(f_rms_eps)
+        if key_dim := hparams.get("num_key_dim"):
+            self.gguf_writer.add_key_length(key_dim)
+        if value_dim := hparams.get("num_value_dim"):
+            self.gguf_writer.add_value_length(value_dim)
+        self.gguf_writer.add_file_type(self.ftype)
+        self.gguf_writer.add_q_lora_rank(hparams["num_query_heads"])
         if self.hparams.get("rope_scaling") is not None and "factor" in self.hparams["rope_scaling"]:
             if self.hparams["rope_scaling"].get("type") == "linear":
                 self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.LINEAR)
                 self.gguf_writer.add_rope_scaling_factor(self.hparams["rope_scaling"]["factor"])
 
     @staticmethod
-    def permute(weights: Tensor, n_head: int, n_head_kv: int | None):
-        if n_head_kv is not None and n_head != n_head_kv:
-            n_head = n_head_kv
-        return (weights.reshape(n_head, 2, weights.shape[0] // n_head // 2, *weights.shape[1:])
-                .swapaxes(1, 2)
-                .reshape(weights.shape))
+    def permute(weights: Tensor, n_heads: int):
+        """
+        Apply the rotary positional embedding-aware permutation used in LLaMA.
+        weights: [hidden_dim, ...]
+        n_heads: number of heads (query or key)
+        """
+
+        head_dim = weights.shape[0] // n_heads
+        assert head_dim % 2 == 0, f"head_dim must be even, got {head_dim}"
+        half = head_dim // 2
+
+        # shape: [n_heads, 2, head_dim/2, ...]
+        return (weights.reshape(n_heads, 2, half, *weights.shape[1:])
+                    .swapaxes(1, 2)
+                    .reshape(weights.shape)
+                    .squeeze())
 
     _experts: list[dict[str, Tensor]] | None = None
 
@@ -1860,9 +1875,9 @@ class LlamaModel(TextModel):
 
         if self.undo_permute:
             if name.endswith(("q_proj.weight", "q_proj.bias")):
-                data_torch = LlamaModel.permute(data_torch, n_head, n_head)
+                data_torch = LlamaModel.permute(data_torch, self.hparams["num_query_heads"])
             if name.endswith(("k_proj.weight", "k_proj.bias")):
-                data_torch = LlamaModel.permute(data_torch, n_head, n_kv_head)
+                data_torch = LlamaModel.permute(data_torch, self.hparams["num_key_heads"])
 
         # process the experts separately
         if name.find("block_sparse_moe.experts") != -1:
