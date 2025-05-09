@@ -4575,10 +4575,8 @@ struct llm_build_llama : public llm_graph_context {
                 ggml_tensor * attn_reshape = ggml_reshape_3d(ctx0, attn, attn->ne[0] / n_q_head, attn->ne[1], n_q_head); // (128, 512, 5)
                 ggml_tensor * wv_b_reshape = ggml_reshape_3d(ctx0, model.layers[il].wv_b, 128, 256, 5); // (128, 256, 5)
                 ggml_tensor * einsum = ggml_mul_mat(ctx0, wv_b_reshape, attn_reshape); // (256, 512, 5)
-
-                attn = ggml_reshape_3d(ctx0, attn, attn->ne[0]/n_q_head, attn->ne[1], n_q_head); // (128, 512, 5)
-                attn = ggml_repeat(ctx0, attn, einsum);
-                attn = ggml_add(ctx0, attn, einsum);
+                
+                attn = ggml_add(ctx0, einsum, attn_reshape);
                 attn = ggml_cont(ctx0, attn);
                 attn = ggml_reshape_2d(ctx0, attn, n_embd, attn->ne[1]);
 
