@@ -1400,7 +1400,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & n_ctx = cparams.n_ctx;
 
     const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
-    const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il) * 2;
+    const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
     const auto n_tokens = q_cur->ne[2];
 
@@ -1446,7 +1446,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const int64_t n_head_kv = hparams.n_head_kv(il);
 
     const auto & n_embd_head_k = hparams.n_embd_head_k;
-    const auto & n_embd_head_v = hparams.n_embd_head_v * 2;
+    const auto & n_embd_head_v = hparams.n_embd_head_v;
 
     ggml_tensor * q = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
     //cb(q, "q", il);

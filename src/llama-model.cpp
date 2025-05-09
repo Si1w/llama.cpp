@@ -506,7 +506,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
         hparams.n_embd_head_k = hparams.n_embd / hparams.n_head();
         ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH, hparams.n_embd_head_k, false);
 
-        hparams.n_embd_head_v = hparams.n_embd / hparams.n_head();
+        hparams.n_embd_head_v = 128;
         ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH, hparams.n_embd_head_v, false);
 
         // sanity check for n_rot (optional)
@@ -1723,15 +1723,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.wg = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_embd}, 0);
                         layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * 5}, 0);
                         layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_head_k}, 0);
-                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_head_v * 2}, 0);
+                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_head_v}, 0);
                         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0);
-                        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), {n_embd_head_v * 5 * 2, n_embd_head_v * 4}, 0);
+                        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), {n_embd / 2, n_embd_head_v * 2}, 0);
 
                         // optional bias tensors
                         layer.bg = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "bias", i), {n_embd}, TENSOR_NOT_REQUIRED);
                         layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd_head_k * 5},     TENSOR_NOT_REQUIRED);
                         layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_head_k}, TENSOR_NOT_REQUIRED);
-                        layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_head_k * 2}, TENSOR_NOT_REQUIRED);
+                        layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_head_v}, TENSOR_NOT_REQUIRED);
                         layer.bo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd},     TENSOR_NOT_REQUIRED);
 
                         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
@@ -4474,10 +4474,9 @@ ggml_tensor * llama_model::get_rope_factors(uint32_t n_ctx_per_seq, int il) cons
 
 struct llm_build_llama : public llm_graph_context {
     llm_build_llama(const llama_model & model, const llm_graph_params & params, ggml_cgraph * gf) : llm_graph_context(params) {
-        const int64_t n_embd_head = hparams.n_embd_head_v;
+        const int64_t n_embd_head = hparams.n_embd_head_k;
         const int64_t n_q_head = 5;
 
-        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
         GGML_ASSERT(n_embd_head == hparams.n_rot);
 
         ggml_tensor * cur;
@@ -4545,7 +4544,7 @@ struct llm_build_llama : public llm_graph_context {
 
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_q_head, n_tokens);
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-                Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_v * 2, n_head_kv, n_tokens);
+                Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_v, n_head_kv, n_tokens);
 
                 if (use_rope) {
                     Qcur = ggml_rope_ext(
@@ -4572,77 +4571,71 @@ struct llm_build_llama : public llm_graph_context {
                         NULL, NULL,
                         Qcur, Kcur, Vcur, nullptr, nullptr, kq_scale, il);
 
+                // Einsum
+                ggml_tensor * attn_reshape = ggml_reshape_3d(ctx0, attn, 128, attn->ne[1], 5); // (128, 512, 5)
+                ggml_tensor * wv_b_reshape = ggml_reshape_3d(ctx0, model.layers[il].wv_b, 128, 256, 5); // (128, 256, 5)
+                ggml_tensor * einsum = ggml_mul_mat(ctx0, wv_b_reshape, attn_reshape); // (256, 512, 5)
+
+                attn = ggml_reshape_3d(ctx0, attn, attn->ne[0]/n_q_head, attn->ne[1], n_q_head); // (128, 512, 5)
+                attn = ggml_repeat(ctx0, attn, einsum);
+                attn = ggml_add(ctx0, attn, einsum);
+                attn = ggml_cont(ctx0, attn);
+                attn = ggml_reshape_2d(ctx0, attn, n_embd, attn->ne[1]);
+
+                attn = ggml_mul(ctx0, attn, Gcur);
+                cur = build_lora_mm(model.layers[il].wo, attn);
+                cb(cur, "attn_out", il);
+
                 // // cur reshape (b, q, h, v) -> (1, 512, 5, 128)
                 // ggml_tensor * attn_reshape = ggml_reshape_4d(ctx0, attn, 1, attn->ne[1], n_q_head, attn->ne[0]/n_q_head);
 
                 // // wv_b shape (h, v, d) -> (5, 128, 256)
                 // ggml_tensor * wv_b_reshape = ggml_reshape_3d(ctx0, model.layers[il].wv_b, n_q_head, n_embd_head * 2, n_embd_head * 4);
 
-                // Einsum
-                // ggml_tensor * attn_reshape = ggml_reshape_3d(ctx0, attn, 128, attn->ne[1], 5); // (128, 512, 5)
-                // ggml_tensor * wv_b_reshape = ggml_reshape_3d(ctx0, model.layers[il].wv_b, 128, 256, 5); // (128, 256, 5)
-                // ggml_tensor * einsum = ggml_mul_mat(ctx0, wv_b_reshape, attn_reshape); // (256, 512, 5)
+                // std::vector<ggml_tensor *> einsum_tensors;
+                // for (int i = 0; i < 5; ++i) {
+                //     ggml_tensor * attn_i = ggml_view_3d(
+                //         ctx0, 
+                //         attn_reshape, 
+                //         attn_reshape->ne[0], 
+                //         attn_reshape->ne[1], 
+                //         attn_reshape->ne[3],
+                //         attn_reshape->nb[1],
+                //         attn_reshape->nb[3],
+                //         i * attn_reshape->nb[2]
+                //     ); // (1, 512, 128)
 
-                // attn = ggml_reshape_3d(ctx0, attn, attn->ne[0]/n_q_head, attn->ne[1], n_q_head); // (128, 512, 5)
+                //     ggml_tensor * wv_b_i = ggml_view_2d(
+                //         ctx0,
+                //         wv_b_reshape,
+                //         wv_b_reshape->ne[1],
+                //         wv_b_reshape->ne[2],
+                //         wv_b_reshape->nb[2],
+                //         i * wv_b_reshape->nb[0]
+                //     ); // (128, 256)
+
+                //     attn_i = ggml_cont(ctx0, attn_i);
+                //     attn_i = ggml_reshape_2d(ctx0, attn_i, attn_i->ne[2], attn_i->ne[0] * attn_i->ne[1]);
+                //     ggml_tensor * prod = ggml_mul_mat(ctx0, wv_b_i, attn_i);
+                //     prod = ggml_reshape_4d(ctx0, prod, 1, 1, attn->ne[1], wv_b_reshape->ne[2]);
+                //     prod = ggml_cont(ctx0, prod);
+                //     einsum_tensors.push_back(prod);
+                // }
+
+                // ggml_tensor * einsum = einsum_tensors[0];
+                // for (size_t i = 1; i < einsum_tensors.size(); ++i) {
+                //     einsum = ggml_concat(ctx0, einsum, einsum_tensors[i], 1);
+                // } // (1, 5, 512, 256)
+                // einsum = ggml_reshape_3d(ctx0, einsum, einsum->ne[0], einsum->ne[2], einsum->ne[1] * einsum->ne[3]); // (1, 512, 1280)
+
+                // attn = ggml_reshape_3d(ctx0, attn, 1, attn->ne[1], attn->ne[0]); // (1, 512, 640)
                 // attn = ggml_repeat(ctx0, attn, einsum);
                 // attn = ggml_add(ctx0, attn, einsum);
-                // attn = ggml_cont(ctx0, attn);
-                // attn = ggml_reshape_2d(ctx0, attn, n_embd, attn->ne[1]);
-
-                // attn = ggml_mul(ctx0, attn, Gcur);
-                // cur = build_lora_mm(model.layers[il].wo, attn);
+                // attn = ggml_cont(ctx0, attn); // (1, 512, 1280)
+                // attn = ggml_reshape_2d(ctx0, attn, attn->ne[0] * attn->ne[2], attn->ne[1]); // (1280, 512)
+                // ggml_tensor * attn_out = ggml_mul(ctx0, attn, Gcur);
+                // cur = build_lora_mm(model.layers[il].wo, attn_out);
                 // cb(cur, "attn_out", il);
-
-                // cur reshape (b, q, h, v) -> (1, 512, 5, 128)
-                ggml_tensor * attn_reshape = ggml_reshape_4d(ctx0, attn, 1, attn->ne[1], n_q_head, attn->ne[0]/n_q_head);
-
-                // wv_b shape (h, v, d) -> (5, 128, 256)
-                ggml_tensor * wv_b_reshape = ggml_reshape_3d(ctx0, model.layers[il].wv_b, n_q_head, n_embd_head * 2, n_embd_head * 4);
-
-                std::vector<ggml_tensor *> einsum_tensors;
-                for (int i = 0; i < 5; ++i) {
-                    ggml_tensor * attn_i = ggml_view_3d(
-                        ctx0, 
-                        attn_reshape, 
-                        attn_reshape->ne[0], 
-                        attn_reshape->ne[1], 
-                        attn_reshape->ne[3],
-                        attn_reshape->nb[1],
-                        attn_reshape->nb[3],
-                        i * attn_reshape->nb[2]
-                    ); // (1, 512, 128)
-
-                    ggml_tensor * wv_b_i = ggml_view_2d(
-                        ctx0,
-                        wv_b_reshape,
-                        wv_b_reshape->ne[1],
-                        wv_b_reshape->ne[2],
-                        wv_b_reshape->nb[2],
-                        i * wv_b_reshape->nb[0]
-                    ); // (128, 256)
-
-                    attn_i = ggml_cont(ctx0, attn_i);
-                    attn_i = ggml_reshape_2d(ctx0, attn_i, attn_i->ne[2], attn_i->ne[0] * attn_i->ne[1]);
-                    ggml_tensor * prod = ggml_mul_mat(ctx0, wv_b_i, attn_i);
-                    prod = ggml_reshape_4d(ctx0, prod, 1, 1, attn->ne[1], wv_b_reshape->ne[2]);
-                    prod = ggml_cont(ctx0, prod);
-                    einsum_tensors.push_back(prod);
-                }
-
-                ggml_tensor * einsum = einsum_tensors[0];
-                for (size_t i = 1; i < einsum_tensors.size(); ++i) {
-                    einsum = ggml_concat(ctx0, einsum, einsum_tensors[i], 1);
-                } // (1, 5, 512, 256)
-                einsum = ggml_reshape_3d(ctx0, einsum, einsum->ne[0], einsum->ne[2], einsum->ne[1] * einsum->ne[3]); // (1, 512, 1280)
-
-                attn = ggml_reshape_3d(ctx0, attn, 1, attn->ne[1], attn->ne[0]); // (1, 512, 640)
-                attn = ggml_repeat(ctx0, attn, einsum);
-                attn = ggml_add(ctx0, attn, einsum);
-                attn = ggml_cont(ctx0, attn); // (1, 512, 1280)
-                attn = ggml_reshape_2d(ctx0, attn, attn->ne[0] * attn->ne[2], attn->ne[1]); // (1280, 512)
-                ggml_tensor * attn_out = ggml_mul(ctx0, attn, Gcur);
-                cur = build_lora_mm(model.layers[il].wo, attn_out);
-                cb(cur, "attn_out", il);
             }
 
             if (il == n_layer - 1) {
