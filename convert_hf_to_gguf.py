@@ -550,9 +550,9 @@ class TextModel(ModelBase):
             self.gguf_writer.add_expert_used_count(n_experts_used)
             logger.info(f"gguf: experts used count = {n_experts_used}")
 
-        if (head_dim := self.hparams.get("head_dim")) is not None:
-            self.gguf_writer.add_key_length(head_dim)
-            self.gguf_writer.add_value_length(head_dim)
+        # if (head_dim := self.hparams.get("head_dim")) is not None:
+        #     self.gguf_writer.add_key_length(head_dim)
+        #     self.gguf_writer.add_value_length(head_dim)
 
         self.gguf_writer.add_file_type(self.ftype)
         logger.info(f"gguf: file type = {self.ftype}")
@@ -1828,6 +1828,9 @@ class LlamaModel(TextModel):
         super().set_gguf_parameters()
         hparams = self.hparams
         self.gguf_writer.add_vocab_size(hparams["vocab_size"])
+        self.gguf_writer.add_head_count_kv(1)
+        self.gguf_writer.add_key_length(self.hparams["key_dim"])
+        self.gguf_writer.add_value_length(self.hparams["value_dim"])
 
         if "head_dim" in hparams:
             rope_dim = hparams["head_dim"]
@@ -1851,8 +1854,8 @@ class LlamaModel(TextModel):
     _experts: list[dict[str, Tensor]] | None = None
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        n_head = self.hparams["num_attention_heads"]
-        n_kv_head = self.hparams.get("num_key_value_heads")
+        n_head_q = self.hparams["num_query_heads"]
+        value_dim = self.hparams["value_dim"]
         is_vision_tensor = "vision_tower" in name \
             or "vision_model" in name \
             or "model.connector" in name \
@@ -1867,9 +1870,7 @@ class LlamaModel(TextModel):
 
         if self.undo_permute:
             if name.endswith(("q_proj.weight", "q_proj.bias")):
-                data_torch = LlamaModel.permute(data_torch, n_head, n_head)
-            if name.endswith(("k_proj.weight", "k_proj.bias")):
-                data_torch = LlamaModel.permute(data_torch, n_head, n_kv_head)
+                data_torch = LlamaModel.permute(data_torch, n_head_q, n_head_q)
 
         # process the experts separately
         if name.find("block_sparse_moe.experts") != -1:

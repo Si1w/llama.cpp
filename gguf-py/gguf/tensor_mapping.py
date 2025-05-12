@@ -205,6 +205,10 @@ class TensorNameMap:
             "language_model.model.layers.{bid}.self_attn.v_proj",        # llama4
         ),
 
+        MODEL_TENSOR.ATTN_G: (
+            "model.layers.{bid}.self_attn.g_proj",
+        ),
+
         # Attention output
         MODEL_TENSOR.ATTN_OUT: (
             "gpt_neox.layers.{bid}.attention.dense",                        # gptneox

@@ -514,7 +514,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
         hparams.n_embd_head_k = hparams.n_embd / hparams.n_head();
         ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH, hparams.n_embd_head_k, false);
 
-        hparams.n_embd_head_v = hparams.n_embd / hparams.n_head();
+        hparams.n_embd_head_v = hparams.n_embd / hparams.n_head() * 2;
         ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH, hparams.n_embd_head_v, false);
 
         // sanity check for n_rot (optional)
@@ -560,6 +560,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                         case 36: type = LLM_TYPE_8B; break; // granite
                         case 40: type = LLM_TYPE_13B; break;
                         case 48: type = LLM_TYPE_34B; break;
+                        case 54: type = LLM_TYPE_1_3B; break;
                         case 60: type = LLM_TYPE_30B; break;
                         case 80: type = hparams.n_head() == hparams.n_head_kv() ? LLM_TYPE_65B : LLM_TYPE_70B; break;
                         default: type = LLM_TYPE_UNKNOWN;
@@ -1737,16 +1738,19 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
-                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
-                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k_gqa}, 0);
-                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v_gqa}, 0);
-                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {1280, 320}, 0);
+                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {1280, 64}, 0);
+                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {1280, 128}, 0);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {1280, 1280}, 0);
+                        layer.wg = create_tensor(tn(LLM_TENSOR_ATTN_G,   "weight", i), {1280, 1280}, 0);
+                        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B,   "weight", i), {640, 256}, TENSOR_NOT_REQUIRED);
 
                         // optional bias tensors
-                        layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), {n_embd},     TENSOR_NOT_REQUIRED);
-                        layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias", i), {n_embd_gqa}, TENSOR_NOT_REQUIRED);
-                        layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), {n_embd_gqa}, TENSOR_NOT_REQUIRED);
-                        layer.bo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd},     TENSOR_NOT_REQUIRED);
+                        layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), {320},     TENSOR_NOT_REQUIRED);
+                        layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias", i), {64}, TENSOR_NOT_REQUIRED);
+                        layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), {128}, TENSOR_NOT_REQUIRED);
+                        layer.bg = create_tensor(tn(LLM_TENSOR_ATTN_G,   "bias", i), {1280},     TENSOR_NOT_REQUIRED);
+                        layer.bo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {1280},     TENSOR_NOT_REQUIRED);
 
                         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
@@ -4491,9 +4495,9 @@ ggml_tensor * llama_model::get_rope_factors(uint32_t n_ctx_per_seq, int il) cons
 
 struct llm_build_llama : public llm_graph_context {
     llm_build_llama(const llama_model & model, const llm_graph_params & params, ggml_cgraph * gf) : llm_graph_context(params) {
-        const int64_t n_embd_head = hparams.n_embd_head_v;
+        const int64_t n_embd_head = hparams.n_embd_head_k;
+        const int64_t n_head_q = 5;
 
-        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
         GGML_ASSERT(n_embd_head == hparams.n_rot);
 
         ggml_tensor * cur;
@@ -4512,7 +4516,7 @@ struct llm_build_llama : public llm_graph_context {
 
         auto * inp_attn = build_attn_inp_kv_unified();
 
-        const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+        const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
         for (int il = 0; il < n_layer; ++il) {
             ggml_tensor * inpSA = inpL;
 
@@ -4553,9 +4557,18 @@ struct llm_build_llama : public llm_graph_context {
                     cb(Vcur, "Vcur", il);
                 }
 
-                Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
+                ggml_tensor * Gcur = build_lora_mm(model.layers[il].wg, cur);
+                cb(Gcur, "Gcur", il);
+                if (model.layers[il].bg) {
+                    Gcur = ggml_add(ctx0, Gcur, model.layers[il].bg);
+                    cb(Gcur, "Gcur", il);
+                }
+                Gcur = ggml_sigmoid(ctx0, Gcur);
+                cb(Gcur, "Gcur_sigmoid", il);
+
+                Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head_q, n_tokens);
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-                Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+                Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head * 2, n_head_kv, n_tokens);
 
                 if (use_rope) {
                     Qcur = ggml_rope_ext(
@@ -4585,9 +4598,23 @@ struct llm_build_llama : public llm_graph_context {
                     cb(Kcur, "Kcur_normed", il);
                 }
 
-                cur = build_attn(inp_attn, gf,
-                        model.layers[il].wo, model.layers[il].bo,
+                ggml_tensor * attn = build_attn(inp_attn, gf,
+                        NULL, NULL,
                         Qcur, Kcur, Vcur, nullptr, nullptr, kq_scale, il);
+
+                ggml_tensor * attn_reshape = ggml_reshape_3d(ctx0, attn, n_head_q, attn->ne[0]/n_head_q, attn->ne[1]);
+                ggml_tensor * v_proj = ggml_reshape_3d(ctx0, model.layers[il].wv_b, n_head_q, model.layers[il].wv_b->ne[0] / n_head_q, model.layers[il].wv_b->ne[1]);
+                attn_reshape = ggml_permute(ctx0, attn_reshape, 2, 0, 1, 3);
+                v_proj = ggml_permute(ctx0, v_proj, 2, 0, 1, 3);
+                ggml_tensor * einsum = ggml_mul_mat(ctx0, v_proj, attn_reshape);
+                einsum = ggml_reshape_2d(ctx0, einsum, einsum->ne[0] * einsum->ne[2], einsum->ne[1]);
+                cb(einsum, "einsum", il);
+                
+                attn = ggml_repeat(ctx0, attn, einsum);
+                attn = ggml_add(ctx0, attn, einsum);
+                attn = ggml_mul(ctx0, Gcur, attn);
+
+                cur = build_lora_mm(model.layers[il].wo, attn);
                 cb(cur, "attn_out", il);
             }
 
