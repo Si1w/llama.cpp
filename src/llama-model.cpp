@@ -1743,7 +1743,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {1280, 128}, 0);
                         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {1280, 1280}, 0);
                         layer.wg = create_tensor(tn(LLM_TENSOR_ATTN_G,   "weight", i), {1280, 1280}, 0);
-                        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B,   "weight", i), {640, 256}, TENSOR_NOT_REQUIRED);
+                        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B,   "weight", i), {128, 256, 5}, TENSOR_NOT_REQUIRED);
 
                         // optional bias tensors
                         layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), {320},     TENSOR_NOT_REQUIRED);
@@ -4598,24 +4598,22 @@ struct llm_build_llama : public llm_graph_context {
                     cb(Kcur, "Kcur_normed", il);
                 }
 
+                // （640, n_token)
                 ggml_tensor * attn = build_attn(inp_attn, gf,
                         NULL, NULL,
                         Qcur, Kcur, Vcur, nullptr, nullptr, kq_scale, il);
+                cb(attn, "attn", il);
 
                 ggml_tensor * attn_reshape = ggml_reshape_3d(ctx0, attn, n_head_q, attn->ne[0]/n_head_q, attn->ne[1]);
-                ggml_tensor * v_proj = ggml_reshape_3d(ctx0, model.layers[il].wv_b, n_head_q, model.layers[il].wv_b->ne[0] / n_head_q, model.layers[il].wv_b->ne[1]);
                 attn_reshape = ggml_permute(ctx0, attn_reshape, 2, 0, 1, 3);
-                v_proj = ggml_permute(ctx0, v_proj, 2, 0, 1, 3);
-                ggml_tensor * einsum = ggml_mul_mat(ctx0, v_proj, attn_reshape);
-                einsum = ggml_reshape_2d(ctx0, einsum, einsum->ne[0] * einsum->ne[2], einsum->ne[1]);
-                cb(einsum, "einsum", il);
+                ggml_tensor * bmm = ggml_mul_mat(ctx0, model.layers[il].wv_b, attn_reshape);
+                bmm = ggml_reshape_2d(ctx0, bmm, bmm->ne[0] * bmm->ne[2], bmm->ne[1]);
+                cb(bmm, "einsum", il);
                 
-                attn = ggml_repeat(ctx0, attn, einsum);
-                attn = ggml_add(ctx0, attn, einsum);
-                attn = ggml_mul(ctx0, Gcur, attn);
-
+                attn = ggml_mul(ctx0, Gcur, bmm);
                 cur = build_lora_mm(model.layers[il].wo, attn);
                 cb(cur, "attn_out", il);
+
             }
 
             if (il == n_layer - 1) {

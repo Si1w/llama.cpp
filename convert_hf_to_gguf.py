@@ -1868,9 +1868,15 @@ class LlamaModel(TextModel):
         elif name.startswith("language_model."):
             name = name.replace("language_model.", "") # for the rest
 
-        if self.undo_permute:
-            if name.endswith(("q_proj.weight", "q_proj.bias")):
-                data_torch = LlamaModel.permute(data_torch, n_head_q, n_head_q)
+        # if self.undo_permute:
+        #     if name.endswith(("q_proj.weight", "q_proj.bias")):
+        #         data_torch = LlamaModel.permute(data_torch, n_head_q, n_head_q)
+        #     if name.endswith(("k_proj.weight", "k_proj.bias")):
+        #         data_torch = LlamaModel.permute(data_torch, n_head_q, self.hparams["num_key_heads"])
+
+        if name.endswith(("v_b_proj.weight")):
+            data_torch = data_torch.view(n_head_q, value_dim, -1) + torch.eye(value_dim).repeat(1, 2)
+            data_torch = data_torch.permute(0, 2, 1)
 
         # process the experts separately
         if name.find("block_sparse_moe.experts") != -1:
