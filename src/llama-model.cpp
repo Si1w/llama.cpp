@@ -13167,92 +13167,90 @@ struct llm_build_plm : public llm_graph_context {
                 q = ggml_mul_mat(ctx0, model.layers[il].wq, cur);
                 cb(q, "q", il);
 
-                // split into {n_head * n_embd_head_qk_nope, n_tokens}
-                ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens,
-                        ggml_row_size(q->type, hparams.n_embd_head_k),
-                        ggml_row_size(q->type, hparams.n_embd_head_k * n_head),
+                // split into {n_embd_head_qk_nope, n_head, n_tokens}
+                ggml_tensor * q_nope = ggml_view_3d(ctx0, q,
+                        n_embd_head_qk_nope, n_head, n_tokens,
+                        ggml_row_size(q->type, n_embd_head_k),
+                        ggml_row_size(q->type, n_embd_head_k) * n_head,
                         0);
                 cb(q_nope, "q_nope", il);
 
-                // and {n_head * n_embd_head_qk_rope, n_tokens}
-                ggml_tensor * q_pe = ggml_view_3d(ctx0, q, n_embd_head_qk_rope, n_head, n_tokens,
-                        ggml_row_size(q->type, hparams.n_embd_head_k),
-                        ggml_row_size(q->type, hparams.n_embd_head_k * n_head),
+                // and {n_embd_head_qk_rope, n_head, n_tokens}
+                ggml_tensor * q_pe = ggml_view_3d(ctx0, q,
+                        n_embd_head_qk_rope, n_head, n_tokens,
+                        ggml_row_size(q->type, n_embd_head_k),
+                        ggml_row_size(q->type, n_embd_head_k) * n_head,
                         ggml_row_size(q->type, n_embd_head_qk_nope));
                 cb(q_pe, "q_pe", il);
 
-                // {n_embd, kv_lora_rank + n_embd_head_qk_rope} * {n_embd, n_tokens} -> {kv_lora_rank + n_embd_head_qk_rope, n_tokens}
-                ggml_tensor * kv_pe_compresseed = ggml_mul_mat(ctx0, model.layers[il].wkv_a_mqa, cur);
-                cb(kv_pe_compresseed, "kv_pe_compresseed", il);
+                ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, model.layers[il].wkv_a_mqa, cur);
+                cb(kv_cmpr_pe, "kv_cmpr_pe", il);
 
                 // split into {kv_lora_rank, n_tokens}
-                ggml_tensor * kv_compressed = ggml_view_2d(ctx0, kv_pe_compresseed, kv_lora_rank, n_tokens,
-                        kv_pe_compresseed->nb[1],
+                ggml_tensor * kv_cmpr = ggml_view_2d(ctx0, kv_cmpr_pe,
+                        kv_lora_rank, n_tokens,
+                        ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
                         0);
-                cb(kv_compressed, "kv_compressed", il);
+                cb(kv_cmpr, "kv_cmpr", il);
 
-                // and {n_embd_head_qk_rope, n_tokens}
-                ggml_tensor * k_pe = ggml_view_3d(ctx0, kv_pe_compresseed, n_embd_head_qk_rope, 1, n_tokens,
-                        kv_pe_compresseed->nb[1],
-                        kv_pe_compresseed->nb[1],
-                        ggml_row_size(kv_pe_compresseed->type, kv_lora_rank));
+                // and {n_embd_head_qk_rope, 1, n_tokens}
+                ggml_tensor * k_pe = ggml_view_3d(ctx0, kv_cmpr_pe,
+                        n_embd_head_qk_rope, 1, n_tokens,
+                        ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
+                        ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
+                        ggml_row_size(kv_cmpr_pe->type, kv_lora_rank));
                 cb(k_pe, "k_pe", il);
 
-                kv_compressed = build_norm(kv_compressed,
-                        model.layers[il].attn_kv_a_norm, NULL,
-                        LLM_NORM_RMS, il);
-                cb(kv_compressed, "kv_compressed", il);
-
-                // {kv_lora_rank, n_head * (n_embd_head_qk_nope + n_embd_head_v)} * {kv_lora_rank, n_tokens} -> {n_head * (n_embd_head_qk_nope + n_embd_head_v), n_tokens}
-                ggml_tensor * kv = ggml_mul_mat(ctx0, model.layers[il].wkv_b, kv_compressed);
-                cb(kv, "kv", il);
-
-                // split into {n_head * n_embd_head_qk_nope, n_tokens}
-                ggml_tensor * k_nope = ggml_view_3d(ctx0, kv, n_embd_head_qk_nope, n_head, n_tokens,
-                        ggml_row_size(kv->type, n_embd_head_qk_nope + hparams.n_embd_head_v),
-                        ggml_row_size(kv->type, n_head * (n_embd_head_qk_nope + hparams.n_embd_head_v)),
-                        0);
-                cb(k_nope, "k_nope", il);
-
-                // and {n_head * n_embd_head_v, n_tokens}
-                ggml_tensor * v_states = ggml_view_3d(ctx0, kv, hparams.n_embd_head_v, n_head, n_tokens,
-                        ggml_row_size(kv->type, (n_embd_head_qk_nope + hparams.n_embd_head_v)),
-                        ggml_row_size(kv->type, (n_embd_head_qk_nope + hparams.n_embd_head_v)*n_head),
-                        ggml_row_size(kv->type, (n_embd_head_qk_nope)));
-                cb(v_states, "v_states", il);
-
-                v_states = ggml_cont(ctx0, v_states);
-                cb(v_states, "v_states", il);
-
-                v_states = ggml_view_2d(ctx0, v_states, hparams.n_embd_head_v * n_head, n_tokens,
-                        ggml_row_size(kv->type, hparams.n_embd_head_v * n_head),
-                        0);
-                cb(v_states, "v_states", il);
-
-                q_pe = ggml_rope_ext(
-                        ctx0, q_pe, inp_pos, nullptr,
+                q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr,
                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow
-                        );
+                );
                 cb(q_pe, "q_pe", il);
 
-                // shared RoPE key
-                k_pe = ggml_rope_ext(
-                        ctx0, k_pe, inp_pos, nullptr,
+                k_pe = ggml_rope_ext(ctx0, k_pe, inp_pos, nullptr,
                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow
-                        );
+                );
                 cb(k_pe, "k_pe", il);
 
-                ggml_tensor * q_states = ggml_concat(ctx0, q_nope, q_pe, 0);
-                cb(q_states, "q_states", il);
+                kv_cmpr = build_norm(kv_cmpr,
+                        model.layers[il].attn_kv_a_norm, nullptr,
+                        LLM_NORM_RMS, il);
+                cb(kv_cmpr, "kv_cmpr", il);
 
-                ggml_tensor * k_states = ggml_concat(ctx0, k_nope, ggml_repeat(ctx0, k_pe, q_pe), 0);
-                cb(k_states, "k_states", il);
+                ggml_tensor * kv = ggml_mul_mat(ctx0, model.layers[il].wkv_b, kv_cmpr);
+                cb(kv, "kv", il);
 
+                // split into {n_embd_head_qk_nope, n_head, n_tokens}
+                ggml_tensor * k_nope = ggml_view_3d(ctx0, kv,
+                        n_embd_head_qk_nope, n_head, n_tokens,
+                        ggml_row_size(kv->type, n_embd_head_qk_nope + n_embd_head_v),
+                        ggml_row_size(kv->type, n_embd_head_qk_nope + n_embd_head_v) * n_head,
+                        0);
+                cb(k_nope, "k_nope_view", il);
+
+                // and {n_embd_head_v, n_head, n_tokens}
+                ggml_tensor * Vcur = ggml_view_3d(ctx0, kv,
+                        n_embd_head_v, n_head, n_tokens,
+                        ggml_row_size(kv->type, n_embd_head_qk_nope + n_embd_head_v),
+                        ggml_row_size(kv->type, n_embd_head_qk_nope + n_embd_head_v) * n_head,
+                        ggml_row_size(kv->type, n_embd_head_qk_nope));
+                cb(Vcur, "Vcur_view", il);
+
+                Vcur = ggml_cont(ctx0, Vcur);
+                cb(Vcur, "Vcur_cont", il);
+
+                // note: rope must go first for in-place context shifting in build_rope_shift()
+                ggml_tensor * Qcur = ggml_concat(ctx0, q_pe, q_nope, 0);
+                cb(Qcur, "Qcur", il);
+
+                ggml_tensor * Kcur = ggml_concat(ctx0, ggml_repeat(ctx0, k_pe, q_pe), k_nope, 0);
+                cb(Kcur, "Kcur", il);
+
+                // note: MLA without the absorption optimization converts into MHA (ie: GQA with full n_head groups)
                 cur = build_attn(inp_attn, gf,
                         model.layers[il].wo, NULL,
-                        q_states, k_states, v_states, nullptr, nullptr, kq_scale, il);
+                        Qcur, Kcur, Vcur, nullptr, nullptr, kq_scale, il);
             }
 
             if (il == n_layer - 1) {
