@@ -3449,7 +3449,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.wq        = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
                         layer.wkv_a_mqa = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i), {n_embd, kv_lora_rank + (n_embd_head_qk_rope)}, 0);
                         layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {kv_lora_rank}, 0);
-                        layer.wkv_b     = create_tensor(tn(LLM_TENSOR_ATTN_KV_B,     "weight", i), {kv_lora_rank, n_head * (n_embd_head_qk_nope + n_embd_head_v)}, 0);
+                        // layer.wkv_b     = create_tensor(tn(LLM_TENSOR_ATTN_KV_B,     "weight", i), {kv_lora_rank, n_head * (n_embd_head_qk_nope + n_embd_head_v)}, 0);
+                        layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K_B, "weight", i), {n_embd_head_qk_nope, kv_lora_rank, n_head}, 0);
+                        layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), {kv_lora_rank, n_embd_head_v, n_head}, 0);
                         layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT,      "weight", i), {              n_head * (                      n_embd_head_v), n_embd}, 0);
 
                         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
@@ -13218,39 +13220,38 @@ struct llm_build_plm : public llm_graph_context {
                         LLM_NORM_RMS, il);
                 cb(kv_cmpr, "kv_cmpr", il);
 
-                ggml_tensor * kv = ggml_mul_mat(ctx0, model.layers[il].wkv_b, kv_cmpr);
-                cb(kv, "kv", il);
+                // {n_embd_head_qk_nope, n_tokens, n_head}
+                q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
+                cb(q_nope, "q_nope_perm", il);
 
-                // split into {n_embd_head_qk_nope, n_head, n_tokens}
-                ggml_tensor * k_nope = ggml_view_3d(ctx0, kv,
-                        n_embd_head_qk_nope, n_head, n_tokens,
-                        ggml_row_size(kv->type, n_embd_head_qk_nope + n_embd_head_v),
-                        ggml_row_size(kv->type, n_embd_head_qk_nope + n_embd_head_v) * n_head,
-                        0);
-                cb(k_nope, "k_nope_view", il);
+                // {n_embd_head_qk_nope, kv_lora_rank, n_head} x {n_embd_head_qk_nope, n_tokens, n_head}
+                ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, model.layers[il].wk_b, q_nope);
+                cb(q_nope_absorbed, "q_nope_absorbed", il);
 
-                // and {n_embd_head_v, n_head, n_tokens}
-                ggml_tensor * Vcur = ggml_view_3d(ctx0, kv,
-                        n_embd_head_v, n_head, n_tokens,
-                        ggml_row_size(kv->type, n_embd_head_qk_nope + n_embd_head_v),
-                        ggml_row_size(kv->type, n_embd_head_qk_nope + n_embd_head_v) * n_head,
-                        ggml_row_size(kv->type, n_embd_head_qk_nope));
-                cb(Vcur, "Vcur_view", il);
+                // {kv_lora_rank, n_head, n_tokens}
+                q_nope_absorbed = ggml_permute(ctx0, q_nope_absorbed, 0, 2, 1, 3);
+                cb(q_nope_absorbed, "q_nope_absorbed_perm", il);
 
-                Vcur = ggml_cont(ctx0, Vcur);
-                cb(Vcur, "Vcur_cont", il);
-
+                // {n_embd_head_qk_rope + kv_lora_rank, n_head, n_tokens}
                 // note: rope must go first for in-place context shifting in build_rope_shift()
-                ggml_tensor * Qcur = ggml_concat(ctx0, q_pe, q_nope, 0);
+                ggml_tensor * Qcur = ggml_concat(ctx0, q_pe, q_nope_absorbed, 0);
                 cb(Qcur, "Qcur", il);
 
-                ggml_tensor * Kcur = ggml_concat(ctx0, ggml_repeat(ctx0, k_pe, q_pe), k_nope, 0);
+                kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
+                cb(kv_cmpr, "kv_cmpr_reshape", il);
+
+                // {n_embd_head_qk_rope + kv_lora_rank, 1, n_tokens}
+                ggml_tensor * Kcur = ggml_concat(ctx0, k_pe, kv_cmpr, 0);
                 cb(Kcur, "Kcur", il);
 
-                // note: MLA without the absorption optimization converts into MHA (ie: GQA with full n_head groups)
+                // {kv_lora_rank, 1, n_tokens}
+                ggml_tensor * Vcur = kv_cmpr;
+                cb(Vcur, "Vcur", il);
+
+                // note: MLA with the absorption optimzation converts into MQA (ie: GQA with 1 group)
                 cur = build_attn(inp_attn, gf,
                         model.layers[il].wo, NULL,
-                        Qcur, Kcur, Vcur, nullptr, nullptr, kq_scale, il);
+                        Qcur, Kcur, Vcur, nullptr, model.layers[il].wv_b, kq_scale, il);
             }
 
             if (il == n_layer - 1) {
