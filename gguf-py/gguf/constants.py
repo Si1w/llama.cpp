@@ -372,6 +372,7 @@ class MODEL_TENSOR(IntEnum):
     ATTN_Q               = auto()
     ATTN_K               = auto()
     ATTN_V               = auto()
+    ATTN_G               = auto()
     ATTN_QKV             = auto()
     ATTN_OUT             = auto()
     ATTN_NORM            = auto()
@@ -658,6 +659,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ATTN_Q:                    "blk.{bid}.attn_q",
     MODEL_TENSOR.ATTN_K:                    "blk.{bid}.attn_k",
     MODEL_TENSOR.ATTN_V:                    "blk.{bid}.attn_v",
+    MODEL_TENSOR.ATTN_G:                    "blk.{bid}.attn_g",
     MODEL_TENSOR.ATTN_OUT:                  "blk.{bid}.attn_output",
     MODEL_TENSOR.ATTN_ROT_EMBD:             "blk.{bid}.attn_rot_embd",
     MODEL_TENSOR.ATTN_Q_NORM:               "blk.{bid}.attn_q_norm",
@@ -910,6 +912,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_Q,
         MODEL_TENSOR.ATTN_K,
         MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_V_B,
+        MODEL_TENSOR.ATTN_G,
         MODEL_TENSOR.ATTN_OUT,
         MODEL_TENSOR.ATTN_ROT_EMBD,
         MODEL_TENSOR.FFN_GATE_INP,
